@@ -281,7 +281,7 @@ plot_series(axes[1,1], h_pl_han["grad_norm"], h_pl_ours["grad_norm"],
 fig.suptitle("Bilevel Optimization on St(d,r): RHGD-HINV vs R-HJFBiO",
              fontsize=14, fontweight="bold", y=0.99)
 plt.tight_layout(rect=[0, 0, 1, 0.96])
-plt.savefig("/mnt/user-data/outputs/comparison_plot.png", dpi=150, bbox_inches="tight")
+plt.savefig("outputs/comparison_plot.png", dpi=150, bbox_inches="tight")
 plt.close()
 
 # Summary
