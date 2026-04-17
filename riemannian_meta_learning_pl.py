@@ -67,6 +67,15 @@ Concretely, the modifications below are:
     Hess_w g at w*, gap to first positive eigenvalue) -- an empirical
     read on the claim of BCR26 Lemma 2.2 on the actual data.
 
+  * Added a head-to-head solver-quality measurement (--measure_hg_quality):
+    on the same problem (same Hess, same RHS) at each outer step,
+    compute v with three different solvers -- Morse-Bott pinv, ridge CG
+    with the configured eps_pl and cg_steps, ridge CG with cg_steps_long
+    extra iterations -- and report each method's relative error to the
+    Moore-Penrose pinv reference. This is the head-to-head experiment
+    that demonstrates the BCR26 advantage: ridge CG with eps_pl ~ lam
+    blows up as lam -> 0, while the Morse-Bott pinv stays accurate.
+
 This script is instrumented to compare three lower-level regimes:
 
   (A) STRONG_CONVEX:  g(theta, w) = L(theta, w; D_s) + (lam/2) * ||w||^2
@@ -134,15 +143,21 @@ the standard pickle files and pass --real_data.
 
 Usage
 -----
-  python riemannian_meta_learning_pl.py --regime strong_convex
-  python riemannian_meta_learning_pl.py --regime pl_only
-  python riemannian_meta_learning_pl.py --regime tiny_lam --lam 1e-6
-  python riemannian_meta_learning_pl.py --regime all   # runs all three
+All experiment settings live in the SETTINGS class near the top of this
+file (search for ">>>  EDIT HERE  <<<"). To change what runs, edit the
+values in SETTINGS, then run:
+
+    python riemannian_meta_learning_pl.py
+
+Common edits:
+  * SETTINGS.REGIME = "all"            -> compare strong_convex / tiny_lam / pl_only
+  * SETTINGS.REGIME = "pl_only"        -> just the PL regime
+  * SETTINGS.MEASURE_HG_QUALITY = True -> also generate solver_quality.png
+                                          (the head-to-head BCR26 plot)
 """
 
 from __future__ import annotations
 
-import argparse
 import math
 import os
 import random
@@ -162,6 +177,62 @@ except ImportError as e:
         "geoopt is required. Install with `pip install geoopt`.\n"
         "Original error: %s" % e
     )
+
+
+# #############################################################################
+# #############################################################################
+# ##                                                                         ##
+# ##                  >>>  EDIT HERE TO CHANGE WHAT RUNS  <<<                ##
+# ##                                                                         ##
+# ##  This is the ONLY block you need to touch to change the experiment.     ##
+# ##  Edit the values in the SETTINGS class below, then run:                 ##
+# ##                                                                         ##
+# ##      python riemannian_meta_learning_pl.py                              ##
+# ##                                                                         ##
+# #############################################################################
+# #############################################################################
+
+class SETTINGS:
+    # ---- Which regime(s) to run --------------------------------------------
+    # Options: "strong_convex", "tiny_lam", "pl_only", or "all".
+    # See the per-regime defaults in REGIME_CONFIGS further down (search for
+    # "REGIME_CONFIGS"); each regime fixes (lam, eps_pl, use_morse_bott).
+    REGIME = "all"
+
+    # ---- Per-regime overrides (None = use the regime's default) -----------
+    LAM = None        # Lower-level L2 strength (None: per-regime default)
+    EPS_PL = None     # Legacy ridge solver regularization (None: per-regime)
+
+    # ---- Solver choice ----------------------------------------------------
+    # USE_MORSE_BOTT: True/False/None.  None = per-regime default
+    # (False for strong_convex, True for tiny_lam and pl_only).
+    USE_MORSE_BOTT = None
+    N_LANCZOS = 30    # Lanczos iterations for Hessian spectral probe
+
+    # ---- Head-to-head solver-quality measurement (the BCR26 plot) --------
+    # When True, at each outer step we ALSO compute v with two ridge-CG
+    # variants and report each method's relative error against the
+    # Moore-Penrose pinv reference. Generates solver_quality.png in
+    # addition to comparison.png. Adds ~2x compute per step.
+    MEASURE_HG_QUALITY = True
+    CG_STEPS_LONG = 200   # CG iterations for the "more compute" baseline
+
+    # ---- Training schedule -----------------------------------------------
+    # N_OUTER and N_TASKS_PER_BATCH adapt to MEASURE_HG_QUALITY when set
+    # to None: 200/4 normally, 100/2 with quality measurement.
+    N_OUTER = None
+    N_INNER = 30
+    N_TASKS_PER_BATCH = None
+
+    # ---- Reproducibility & I/O -------------------------------------------
+    SEED = 0
+    DEVICE = None     # None = auto-detect (cuda if available, else cpu)
+    OUT_DIR = "./outputs_riem_meta_pl"
+
+
+# #############################################################################
+# ##                  END OF USER-EDITABLE CONFIGURATION                     ##
+# #############################################################################
 
 
 # ---------------------------------------------------------------------------
@@ -661,6 +732,131 @@ def morse_bott_pinv_solve(
     return v_flat.view(n_way, d)
 
 
+# ---------------------------------------------------------------------------
+# Head-to-head solver quality measurement
+# ---------------------------------------------------------------------------
+# Even when the OUTER loop converges to similar loss/accuracy across regimes
+# (as the previous comparison plot showed), the per-step HYPERGRADIENT
+# QUALITY can differ dramatically. The Moore-Penrose pseudoinverse from
+# BCR26 Lemma 2.2 is the structurally correct object; SC-style ridge CG
+# with eps_pl ~ lam is a different object whose error blows up as lam -> 0.
+#
+# evaluate_solver_quality measures, on the SAME problem (same Hess, same
+# RHS), how close each solver's v is to the reference Moore-Penrose pinv.
+# This is the head-to-head experiment that makes the SC-vs-PL contrast
+# unambiguous.
+# ---------------------------------------------------------------------------
+
+
+def evaluate_solver_quality(
+    apply_H,                            # callable: (n_way, d) -> (n_way, d)
+    b: torch.Tensor,                    # (n_way, d) RHS = grad_w f
+    mb_struct: Dict[str, object],       # output of morse_bott_structure
+    eps_pl_legacy: float,               # eps used by the legacy ridge solver
+    cg_steps_legacy: int,               # cg steps used by the legacy ridge solver
+    cg_steps_long: int = 200,           # how many CG steps to give legacy "all the rope"
+    ref_threshold_ratio: float = 0.01,  # tighter threshold for the reference pinv
+) -> Dict[str, float]:
+    """Measure how well each candidate v-solver approximates the
+    Moore-Penrose pseudoinverse of Hess_w g, applied to b.
+
+    Returns dict with relative errors w.r.t. the reference (which is the
+    truncated-spectrum pinv with a tight threshold, i.e., the structural
+    answer that BCR26 Lemma 2.2 picks out).
+
+    Keys returned:
+        v_ref_norm                  norm of the reference v
+        err_morse_bott              ||v_MB    - v_ref|| / ||v_ref||
+                                    (MB = configured threshold)
+        err_ridge_cg_short          ||v_ridge_short - v_ref|| / ||v_ref||
+                                    (legacy: configured eps_pl + cg_steps)
+        err_ridge_cg_long           same but with cg_steps_long iterations
+                                    (does extra compute close the gap?)
+        err_zero                    ||0 - v_ref|| / ||v_ref|| = 1.0
+                                    (sanity check: an unhelpful baseline)
+
+    Interpretation:
+      * err_morse_bott should be near 0 (~1e-3 or better): the configured
+        Morse-Bott threshold is a robust approximation to the true pinv.
+      * err_ridge_cg_short should be SMALL when eps_pl is large
+        (strongly-convex regime: Hess + eps*I is well-conditioned, CG
+        converges quickly and matches pinv up to O(eps)). It should be
+        LARGE when eps_pl is tiny (PL regime: Hess + eps*I has condition
+        number L/eps, CG can't converge in cg_steps iterations).
+      * err_ridge_cg_long shows whether throwing more CG iterations at the
+        problem closes the gap. In the truly rank-deficient case, even
+        infinite CG cannot recover the pinv answer because the kernel
+        components blow up as 1/eps.
+    """
+    eigvals = mb_struct["eigvals"].to(b.device)
+    eigvecs = mb_struct["eigvecs"]
+    L_hess = float(mb_struct["L_hess"])
+    n_way, d = b.shape
+
+    # --- Reference v: truncated-spectrum pinv with a TIGHT threshold ---
+    # We use a 1%-of-L threshold (vs the 5% used by the configured MB
+    # solver) to get a more accurate pinv, while still excluding the
+    # numerically-zero kernel directions.
+    ref_threshold = ref_threshold_ratio * L_hess
+    rng_mask_ref = eigvals >= ref_threshold
+    if rng_mask_ref.sum().item() == 0:
+        # Nothing in range -- pinv is 0.
+        return {
+            "v_ref_norm": 0.0,
+            "err_morse_bott": float("nan"),
+            "err_ridge_cg_short": float("nan"),
+            "err_ridge_cg_long": float("nan"),
+            "err_zero": 0.0,
+        }
+    U_ref = eigvecs[:, rng_mask_ref]
+    lam_ref = eigvals[rng_mask_ref]
+    b_flat = b.reshape(-1)
+    v_ref_flat = U_ref @ ((U_ref.t() @ b_flat) / lam_ref)
+    v_ref = v_ref_flat.view(n_way, d)
+    v_ref_norm = float(v_ref.norm().item())
+    if v_ref_norm < 1e-20:
+        return {
+            "v_ref_norm": v_ref_norm,
+            "err_morse_bott": float("nan"),
+            "err_ridge_cg_short": float("nan"),
+            "err_ridge_cg_long": float("nan"),
+            "err_zero": 0.0,
+        }
+
+    def relerr(v: torch.Tensor) -> float:
+        return float((v - v_ref).norm().item() / v_ref_norm)
+
+    # --- Morse-Bott pinv at the CONFIGURED threshold ---
+    rng_mask_mb = eigvals >= mb_struct["threshold"]
+    if rng_mask_mb.sum().item() > 0:
+        U_mb = eigvecs[:, rng_mask_mb]
+        lam_mb = eigvals[rng_mask_mb]
+        v_mb_flat = U_mb @ ((U_mb.t() @ b_flat) / lam_mb)
+        v_mb = v_mb_flat.view(n_way, d)
+        err_mb = relerr(v_mb)
+    else:
+        err_mb = 1.0  # everything killed -> v_mb = 0
+
+    # --- Legacy ridge CG with the configured (eps_pl, cg_steps) ---
+    def apply_A_legacy(v: torch.Tensor) -> torch.Tensor:
+        return apply_H(v) + eps_pl_legacy * v
+
+    v_ridge_short = conjugate_gradient(apply_A_legacy, b, n_steps=cg_steps_legacy)
+    err_ridge_short = relerr(v_ridge_short)
+
+    # --- Same legacy solver but with many more CG iterations ---
+    v_ridge_long = conjugate_gradient(apply_A_legacy, b, n_steps=cg_steps_long)
+    err_ridge_long = relerr(v_ridge_long)
+
+    return {
+        "v_ref_norm": v_ref_norm,
+        "err_morse_bott": err_mb,
+        "err_ridge_cg_short": err_ridge_short,
+        "err_ridge_cg_long": err_ridge_long,
+        "err_zero": 1.0,
+    }
+
+
 def hypergradient_cg(
     backbone: StiefelCNN,
     support_x: torch.Tensor,
@@ -675,6 +871,8 @@ def hypergradient_cg(
     eps_pl: float,
     use_morse_bott: bool = True,
     n_lanczos: int = 30,
+    measure_hg_quality: bool = False,
+    cg_steps_long: int = 200,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Compute an approximation of grad_Theta F for a single task.
 
@@ -730,23 +928,29 @@ def hypergradient_cg(
     # is the lower-level problem.
     feats_s_det = feats_s.detach()
 
-    # ---- Pick the solver route ----
-    mb_struct: Dict[str, object] = {}
-    if use_morse_bott:
-        # Route (b): Moore-Penrose pseudoinverse via Morse-Bott split.
-        # This is the structural contribution from BCR26 Lemma 2.2.
-        def apply_H_raw(v: torch.Tensor) -> torch.Tensor:
-            # eps_pl = 0 here: the whole point of the Morse-Bott solver
-            # is to avoid lifting ker Hess with a scalar ridge.
-            return hessian_vector_product(
-                feats_s_det, support_y, w_star, v, lam=lam_lower, eps_pl=0.0,
-            )
+    # Raw HVP without the legacy ridge: this is what BCR26 actually wants.
+    def apply_H_raw(v: torch.Tensor) -> torch.Tensor:
+        return hessian_vector_product(
+            feats_s_det, support_y, w_star, v, lam=lam_lower, eps_pl=0.0,
+        )
 
+    # ---- Pick the solver route ----
+    # We may need mb_struct (eigendecomposition of Hess_w g at w*) for either:
+    #   - the actual update (use_morse_bott=True)
+    #   - the head-to-head solver-quality measurement (measure_hg_quality=True)
+    # Compute it once if either flag requires it.
+    mb_struct: Dict[str, object] = {}
+    need_mb = use_morse_bott or measure_hg_quality
+    if need_mb:
         mb_struct = morse_bott_structure(
             feats_s_det, support_y, w_star, lam=lam_lower,
             n_lanczos=min(n_lanczos, n_way * feats_s_det.size(1)),
             gap_ratio=0.05,
         )
+
+    if use_morse_bott:
+        # Route (b): Moore-Penrose pseudoinverse via Morse-Bott split.
+        # This is the structural contribution from BCR26 Lemma 2.2.
         v_star = morse_bott_pinv_solve(
             apply_H_raw, grad_w_f, mb_struct, cg_steps=cg_steps,
         )
@@ -784,11 +988,27 @@ def hypergradient_cg(
     # ---- Diagnostics: empirical mu_SC vs mu_PL on the lower-level problem ----
     diag = estimate_pl_vs_sc(
         feats_s_det, support_y, w_star, lam=lam_lower, n_way=n_way,
-        mb_struct=mb_struct if use_morse_bott else None,
+        mb_struct=mb_struct if need_mb else None,
         inner_lr=inner_lr,
     )
     diag["upper_loss"] = f_value.item()
     diag["used_morse_bott"] = 1.0 if use_morse_bott else 0.0
+
+    # ---- Head-to-head solver-quality diagnostics ----
+    # When measure_hg_quality=True, we compare three v-solvers on the SAME
+    # problem (same Hess, same RHS = grad_w f) and report each method's
+    # relative error against the Moore-Penrose pinv reference. This is the
+    # head-to-head experiment that demonstrates the BCR26 advantage:
+    # ridge-CG with eps_pl ~ lam blows up as lam -> 0, while the Morse-Bott
+    # pinv stays accurate.
+    if measure_hg_quality and need_mb:
+        q = evaluate_solver_quality(
+            apply_H_raw, grad_w_f, mb_struct,
+            eps_pl_legacy=eps_pl, cg_steps_legacy=cg_steps,
+            cg_steps_long=cg_steps_long,
+        )
+        diag.update(q)
+
     return f_value.detach(), diag
 
 
@@ -1017,6 +1237,14 @@ class RunConfig:
                                  # fall back to the legacy (Hess + eps_pl*I)
                                  # ridge solve for comparison.
     n_lanczos: int = 30          # Lanczos iterations for Hessian spectrum
+    # --- Head-to-head solver-quality measurement ---
+    measure_hg_quality: bool = False
+                                 # If True, at each outer step compare
+                                 # Morse-Bott pinv vs legacy ridge CG on
+                                 # the SAME problem and report each
+                                 # method's relative error to the
+                                 # Moore-Penrose pinv reference.
+    cg_steps_long: int = 200     # CG steps for the "all the rope" baseline
 
 
 def build_riemannian_optimizer(backbone: StiefelCNN, cfg: RunConfig) -> geoopt.optim.RiemannianSGD:
@@ -1042,6 +1270,10 @@ def run_regime(
         # New BCR26-informed diagnostics:
         "mu_PL_QG": [], "mu_PL_hess": [],
         "dim_ker_hess": [], "dim_range_hess": [], "mb_gap": [],
+        # Head-to-head solver-quality diagnostics (filled when
+        # cfg.measure_hg_quality=True):
+        "err_morse_bott": [], "err_ridge_cg_short": [],
+        "err_ridge_cg_long": [], "v_ref_norm": [],
         "wallclock": [],
     }
 
@@ -1059,8 +1291,11 @@ def run_regime(
             "mu_SC_est": 0.0, "mu_PL_est": 0.0,
             "mu_PL_QG": 0.0, "mu_PL_hess": 0.0,
             "dim_ker_hess": 0.0, "dim_range_hess": 0.0, "mb_gap": 0.0,
+            "err_morse_bott": 0.0, "err_ridge_cg_short": 0.0,
+            "err_ridge_cg_long": 0.0, "v_ref_norm": 0.0,
         }
         mb_gap_valid_count = 0
+        quality_valid_count = 0
 
         for _ in range(cfg.n_tasks_per_batch):
             sx, sy, qx, qy = task_sampler(cfg.n_way, cfg.n_shot, cfg.n_query)
@@ -1076,6 +1311,8 @@ def run_regime(
                 eps_pl=cfg.eps_pl,
                 use_morse_bott=cfg.use_morse_bott,
                 n_lanczos=cfg.n_lanczos,
+                measure_hg_quality=cfg.measure_hg_quality,
+                cg_steps_long=cfg.cg_steps_long,
             )
             batch_loss += f_val.item()
 
@@ -1090,6 +1327,15 @@ def run_regime(
             preds = (feats_q @ w_eval.t()).argmax(dim=1)
             batch_acc += (preds == qy).float().mean().item()
 
+            quality_keys = {
+                "err_morse_bott", "err_ridge_cg_short",
+                "err_ridge_cg_long", "v_ref_norm",
+            }
+            quality_present = (
+                cfg.measure_hg_quality and "err_morse_bott" in diag
+            )
+            if quality_present:
+                quality_valid_count += 1
             for k in diag_accum:
                 v = diag.get(k, 0.0)
                 # mb_gap is NaN when the spectrum is one-sided; track
@@ -1098,6 +1344,9 @@ def run_regime(
                     if v == v:  # not NaN
                         diag_accum[k] += v
                         mb_gap_valid_count += 1
+                elif k in quality_keys:
+                    if quality_present and v == v:  # not NaN
+                        diag_accum[k] += v
                 else:
                     diag_accum[k] += v
 
@@ -1116,6 +1365,12 @@ def run_regime(
                     diag_accum[k] / mb_gap_valid_count
                     if mb_gap_valid_count > 0 else float("nan")
                 )
+            elif k in {"err_morse_bott", "err_ridge_cg_short",
+                       "err_ridge_cg_long", "v_ref_norm"}:
+                diag_accum[k] = (
+                    diag_accum[k] / quality_valid_count
+                    if quality_valid_count > 0 else float("nan")
+                )
             else:
                 diag_accum[k] /= cfg.n_tasks_per_batch
 
@@ -1130,7 +1385,19 @@ def run_regime(
             history["dim_ker_hess"].append(diag_accum["dim_ker_hess"])
             history["dim_range_hess"].append(diag_accum["dim_range_hess"])
             history["mb_gap"].append(diag_accum["mb_gap"])
+            history["err_morse_bott"].append(diag_accum["err_morse_bott"])
+            history["err_ridge_cg_short"].append(diag_accum["err_ridge_cg_short"])
+            history["err_ridge_cg_long"].append(diag_accum["err_ridge_cg_long"])
+            history["v_ref_norm"].append(diag_accum["v_ref_norm"])
             history["wallclock"].append(time.time() - t0)
+
+            qual_str = ""
+            if cfg.measure_hg_quality:
+                qual_str = (
+                    f" | err(MB)={diag_accum['err_morse_bott']:.2e}, "
+                    f"err(ridge,{cfg.cg_steps}cg)={diag_accum['err_ridge_cg_short']:.2e}, "
+                    f"err(ridge,{cfg.cg_steps_long}cg)={diag_accum['err_ridge_cg_long']:.2e}"
+                )
             print(
                 f"[{cfg.regime:>14s}] step {step:4d} | "
                 f"upper_loss={batch_loss:.4f} | "
@@ -1139,7 +1406,8 @@ def run_regime(
                 f"mu_PL_QG~={diag_accum['mu_PL_QG']:.2e} | "
                 f"dim(ker H)~{diag_accum['dim_ker_hess']:.1f}, "
                 f"dim(rng H)~{diag_accum['dim_range_hess']:.1f} | "
-                f"gap={diag_accum['mb_gap']:.2f} | "
+                f"gap={diag_accum['mb_gap']:.2f}"
+                f"{qual_str} | "
                 f"t={time.time()-t0:.1f}s"
             )
 
@@ -1287,6 +1555,116 @@ def plot_comparison(histories: Dict[str, Dict[str, List[float]]], out_path: str)
     print(f"Saved plot to {out_path}")
 
 
+def plot_solver_quality(
+    histories: Dict[str, Dict[str, List[float]]],
+    out_path: str,
+    cg_steps: int,
+    cg_steps_long: int,
+) -> None:
+    """Two-panel plot of head-to-head solver quality.
+
+    Left panel: relative error of each solver's v vs the Moore-Penrose pinv
+    reference, per outer step, on a log scale. The Morse-Bott pinv should
+    sit near 1e-3; ridge CG should be small in the strong_convex regime
+    and LARGE in the PL/tiny_lam regimes.
+
+    Right panel: the same data but flipped to show "extra HVPs to close
+    the gap" -- specifically, the ratio err_ridge_short / err_ridge_long,
+    showing how much the legacy solver improves with cg_steps_long extra
+    iterations. In the SC regime this ratio should be near 1 (already
+    converged); in the PL regime it can be > 1 (more iters help) or = 1
+    (the gap is structural and CG cannot close it).
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib not installed; skipping plot.")
+        return
+
+    # Filter to regimes that actually measured quality.
+    regimes_q = [
+        name for name, h in histories.items()
+        if h.get("err_morse_bott") and any(
+            v == v and v > 0  # not NaN, positive
+            for v in h["err_morse_bott"]
+        )
+    ]
+    if not regimes_q:
+        print("No regimes with quality measurements; skipping solver-quality plot.")
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+
+    # --- Left: per-step relative errors, three solvers, all regimes ---
+    color_cycle = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
+    for i, name in enumerate(regimes_q):
+        h = histories[name]
+        c = color_cycle[i % len(color_cycle)]
+        axes[0].semilogy(
+            h["outer_step"], h["err_morse_bott"],
+            label=f"{name}: Morse-Bott pinv",
+            color=c, linestyle="-", linewidth=2,
+        )
+        axes[0].semilogy(
+            h["outer_step"], h["err_ridge_cg_short"],
+            label=f"{name}: ridge CG ({cg_steps} iters)",
+            color=c, linestyle="--", linewidth=1.5,
+        )
+        axes[0].semilogy(
+            h["outer_step"], h["err_ridge_cg_long"],
+            label=f"{name}: ridge CG ({cg_steps_long} iters)",
+            color=c, linestyle=":", linewidth=1.5,
+        )
+    # Reference horizontal lines.
+    axes[0].axhline(1.0, color="gray", linewidth=1, alpha=0.4)
+    axes[0].text(
+        0, 1.0, "  100% error (zero solution)",
+        fontsize=8, color="gray", verticalalignment="bottom",
+    )
+    axes[0].set_xlabel("outer step")
+    axes[0].set_ylabel(r"$\|v_{\rm method} - v_{\rm pinv}\| / \|v_{\rm pinv}\|$")
+    axes[0].set_title(
+        "Hypergradient v-solver quality\n"
+        "(reference = Moore-Penrose pinv via BCR26 Lem 2.2)"
+    )
+    axes[0].legend(fontsize=7, loc="best")
+    axes[0].grid(alpha=0.3, which="both")
+
+    # --- Right: improvement ratio of ridge CG with extra iterations ---
+    # err_ridge_short / err_ridge_long >> 1 means more iters help; ~ 1 means
+    # the legacy method has stalled (the gap is structural, not iterative).
+    for i, name in enumerate(regimes_q):
+        h = histories[name]
+        c = color_cycle[i % len(color_cycle)]
+        ratios = [
+            (s / l) if (l == l and l > 1e-15) else float("nan")
+            for s, l in zip(h["err_ridge_cg_short"], h["err_ridge_cg_long"])
+        ]
+        axes[1].semilogy(
+            h["outer_step"], ratios,
+            label=name,
+            color=c, linestyle="-", linewidth=2,
+        )
+    axes[1].axhline(1.0, color="gray", linewidth=1, alpha=0.6,
+                    label="ratio = 1 (extra iters do nothing)")
+    axes[1].set_xlabel("outer step")
+    axes[1].set_ylabel(
+        f"err(ridge, {cg_steps} iters) / err(ridge, {cg_steps_long} iters)"
+    )
+    axes[1].set_title(
+        "Does throwing more CG iterations at it help?\n"
+        "(>1: yes; ~1: no, the gap is structural)"
+    )
+    axes[1].legend(fontsize=8)
+    axes[1].grid(alpha=0.3, which="both")
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=120)
+    print(f"Saved plot to {out_path}")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1309,80 +1687,109 @@ REGIME_CONFIGS = {
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--regime", type=str, default="all",
-                        choices=["strong_convex", "tiny_lam", "pl_only", "all"])
-    parser.add_argument("--lam", type=float, default=None,
-                        help="Override lambda (lower-level L2 strength)")
-    parser.add_argument("--eps_pl", type=float, default=None,
-                        help="Override CG regularization (legacy ridge solver)")
-    parser.add_argument("--use_morse_bott", type=str, default="auto",
-                        choices=["auto", "true", "false"],
-                        help=(
-                            "Whether to use the Morse-Bott pseudoinverse "
-                            "solver (BCR26 Lemma 2.2). 'auto' picks per-"
-                            "regime defaults."
-                        ))
-    parser.add_argument("--n_lanczos", type=int, default=30,
-                        help="Lanczos iterations for Hessian spectral probe")
-    parser.add_argument("--n_outer", type=int, default=200)
-    parser.add_argument("--n_inner", type=int, default=30)
-    parser.add_argument("--n_tasks_per_batch", type=int, default=4)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--out_dir", type=str, default="./outputs_riem_meta_pl")
-    args = parser.parse_args()
+    """Run the experiment using the values defined in the SETTINGS class
+    at the top of this file. To change what runs, edit SETTINGS and rerun.
+    """
+    # ---- Resolve mode-dependent defaults from SETTINGS ----
+    # MEASURE_HG_QUALITY adds a dense Hess eigh AND a 200-iter CG every
+    # outer step. To keep wall-clock reasonable, drop n_outer to 100 and
+    # n_tasks_per_batch to 2 unless the user explicitly overrode them in
+    # SETTINGS.
+    n_outer = SETTINGS.N_OUTER
+    n_tasks_per_batch = SETTINGS.N_TASKS_PER_BATCH
+    if SETTINGS.MEASURE_HG_QUALITY:
+        if n_outer is None:
+            n_outer = 100
+        if n_tasks_per_batch is None:
+            n_tasks_per_batch = 2
+    else:
+        if n_outer is None:
+            n_outer = 200
+        if n_tasks_per_batch is None:
+            n_tasks_per_batch = 4
 
-    os.makedirs(args.out_dir, exist_ok=True)
-    device = torch.device(args.device)
+    # Resolve device.
+    if SETTINGS.DEVICE is None:
+        device_str = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        device_str = SETTINGS.DEVICE
+    device = torch.device(device_str)
+
+    # Validate REGIME.
+    valid_regimes = {"strong_convex", "tiny_lam", "pl_only", "all"}
+    if SETTINGS.REGIME not in valid_regimes:
+        raise ValueError(
+            f"SETTINGS.REGIME must be one of {sorted(valid_regimes)}, "
+            f"got {SETTINGS.REGIME!r}"
+        )
+
+    os.makedirs(SETTINGS.OUT_DIR, exist_ok=True)
     print(f"Using device: {device}")
+    print(
+        f"Resolved settings: regime={SETTINGS.REGIME}, "
+        f"n_outer={n_outer}, n_tasks_per_batch={n_tasks_per_batch}, "
+        f"measure_hg_quality={SETTINGS.MEASURE_HG_QUALITY}, "
+        f"out_dir={SETTINGS.OUT_DIR}"
+    )
 
     # Shared data sampler across regimes so comparison is apples-to-apples.
-    dataset = SyntheticFewShotDataset(n_classes=64, seed=args.seed)
+    dataset = SyntheticFewShotDataset(n_classes=64, seed=SETTINGS.SEED)
 
     regimes_to_run = (
-        [args.regime] if args.regime != "all"
+        [SETTINGS.REGIME] if SETTINGS.REGIME != "all"
         else ["strong_convex", "tiny_lam", "pl_only"]
     )
 
     histories: Dict[str, Dict[str, List[float]]] = {}
     for regime in regimes_to_run:
         lam_default, eps_pl_default, mb_default = REGIME_CONFIGS[regime]
-        lam = args.lam if args.lam is not None else lam_default
-        eps_pl = args.eps_pl if args.eps_pl is not None else eps_pl_default
-        if args.use_morse_bott == "auto":
-            use_mb = mb_default
-        else:
-            use_mb = (args.use_morse_bott == "true")
+        lam = SETTINGS.LAM if SETTINGS.LAM is not None else lam_default
+        eps_pl = SETTINGS.EPS_PL if SETTINGS.EPS_PL is not None else eps_pl_default
+        use_mb = (
+            SETTINGS.USE_MORSE_BOTT if SETTINGS.USE_MORSE_BOTT is not None
+            else mb_default
+        )
 
         cfg = RunConfig(
             regime=regime,
             lam=lam,
             eps_pl=eps_pl,
-            n_outer=args.n_outer,
-            n_inner=args.n_inner,
-            n_tasks_per_batch=args.n_tasks_per_batch,
-            seed=args.seed,
+            n_outer=n_outer,
+            n_inner=SETTINGS.N_INNER,
+            n_tasks_per_batch=n_tasks_per_batch,
+            seed=SETTINGS.SEED,
             use_morse_bott=use_mb,
-            n_lanczos=args.n_lanczos,
+            n_lanczos=SETTINGS.N_LANCZOS,
+            measure_hg_quality=SETTINGS.MEASURE_HG_QUALITY,
+            cg_steps_long=SETTINGS.CG_STEPS_LONG,
         )
         print("\n" + "=" * 70)
         print(
             f"Running regime: {regime}  "
-            f"(lam={lam}, eps_pl={eps_pl}, use_morse_bott={use_mb})"
+            f"(lam={lam}, eps_pl={eps_pl}, use_morse_bott={use_mb}, "
+            f"measure_hg_quality={SETTINGS.MEASURE_HG_QUALITY})"
         )
         print("=" * 70)
         h = run_regime(cfg, dataset.sample_task, device)
         histories[regime] = h
 
     if len(histories) > 1:
-        plot_comparison(histories, os.path.join(args.out_dir, "comparison.png"))
+        plot_comparison(histories, os.path.join(SETTINGS.OUT_DIR, "comparison.png"))
+    if SETTINGS.MEASURE_HG_QUALITY:
+        # Solver-quality plot is informative even with a single regime
+        # (it shows three curves per regime: MB, ridge-short, ridge-long).
+        plot_solver_quality(
+            histories,
+            os.path.join(SETTINGS.OUT_DIR, "solver_quality.png"),
+            cg_steps=20,                  # default cg_steps from RunConfig
+            cg_steps_long=SETTINGS.CG_STEPS_LONG,
+        )
 
     # Save raw histories.
     import json
-    with open(os.path.join(args.out_dir, "histories.json"), "w") as fp:
+    with open(os.path.join(SETTINGS.OUT_DIR, "histories.json"), "w") as fp:
         json.dump(histories, fp, indent=2)
-    print(f"\nDone. Results in {args.out_dir}/")
+    print(f"\nDone. Results in {SETTINGS.OUT_DIR}/")
 
 
 if __name__ == "__main__":
